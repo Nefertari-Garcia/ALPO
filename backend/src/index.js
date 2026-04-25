@@ -5,7 +5,7 @@ import analyzeRouter from "./routes/analyze.js";
 
 const app = express();
 
-app.use(cors({ origin: process.env.FRONTEND_URL }));
+app.use(cors());  // Acepta cualquier origen para el demo
 app.use(express.json());
 app.use("/api", analyzeRouter);
 
