@@ -1,0 +1,28 @@
+# Variables de entorno (NUNCA subir al repositorio)
+backend/.env
+contracts/.env
+frontend/.env
+
+# Dependencias
+backend/node_modules/
+frontend/node_modules/
+
+# Build
+frontend/dist/
+contracts/out/
+contracts/cache/
+
+# Foundry
+contracts/broadcast/
+contracts/lib/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Editor
+.vscode/
+.idea/
+
+# Kiro specs (interno)
+.kiro/

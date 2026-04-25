@@ -1,0 +1,685 @@
+================================================================================
+ALPO – ESPECIFICACIÓN TÉCNICA COMPLETA PARA DESARROLLO DE PROTOTIPO
+================================================================================
+Versión: 1.0 | Contexto: Hackathon Demo | Estado inicial: 0 líneas de código
+Objetivo: Demo funcional end-to-end en una sola sesión de desarrollo.
+Lee TODA esta especificación antes de escribir la primera línea de código.
+================================================================================
+
+## 1. RESUMEN DEL PROYECTO
+
+ALPO es una herramienta de protección digital para detectar señales tempranas
+de reclutamiento criminal en interacciones de menores. El MVP:
+  1. Recibe un audio grabado/subido desde el navegador.
+  2. Lo transcribe a texto (Whisper API vía OpenAI o HuggingFace).
+  3. Busca la frase de riesgo: "dinero fácil" (case-insensitive, sin tilde también).
+  4. Si hay match: genera un hash SHA-256 del texto + timestamp, almacena ese
+     hash en la blockchain de Monad Testnet mediante un smart contract, devuelve
+     el txHash, y muestra todo en la UI con una alerta visible.
+  5. Registra el evento en PostgreSQL para trazabilidad interna.
+
+NO se requiere login, no se requiere wallet del usuario final: el backend firma
+la transacción con una wallet propia del sistema.
+
+================================================================================
+
+## 2. FLUJO COMPLETO (Happy Path)
+
+  [Usuario] → graba o sube audio (.webm/.mp4/.mp3/.wav)
+      ↓
+  [Frontend React] → POST /api/analyze  (multipart/form-data, campo: "audio")
+      ↓
+  [Backend Node/Express]
+    a) Recibe audio → llama Whisper API → obtiene transcripción (string)
+    b) Normaliza texto (lowercase, quita tildes opcionales)
+    c) Busca "dinero facil" / "dinero fácil" en el texto
+    d) Si NO hay match → responde { detected: false, transcription }
+    e) Si SÍ hay match:
+       - Construye payload: { transcription, timestamp: Date.now(), keyword: "dinero fácil" }
+       - Calcula hash SHA-256 del JSON.stringify(payload)
+       - Llama al smart contract: storeEvidence(bytes32 hash, uint256 timestamp)
+       - Guarda en PostgreSQL: tabla `evidence_logs` (ver esquema abajo)
+       - Responde { detected: true, transcription, hash, txHash, timestamp }
+      ↓
+  [Frontend] → muestra resultado en Pantalla 2:
+    - Transcripción completa
+    - Badge rojo "⚠ FRASE DETECTADA: dinero fácil"
+    - Hash generado
+    - TxHash con link al explorador de Monad Testnet
+    - Alerta: "Tutor notificado" (simulado en UI, sin email real en demo)
+
+================================================================================
+
+## 3. ESTRUCTURA DE CARPETAS
+
+  alpo/
+  ├── frontend/          ← React + Vite
+  │   ├── src/
+  │   │   ├── App.jsx
+  │   │   ├── components/
+  │   │   │   ├── AudioRecorder.jsx   ← graba con MediaRecorder API
+  │   │   │   ├── FileUploader.jsx    ← input type file
+  │   │   │   └── ResultPanel.jsx     ← muestra resultado
+  │   │   └── main.jsx
+  │   ├── index.html
+  │   └── vite.config.js
+  │
+  ├── backend/           ← Node.js + Express
+  │   ├── src/
+  │   │   ├── index.js           ← servidor principal
+  │   │   ├── routes/
+  │   │   │   └── analyze.js     ← POST /api/analyze
+  │   │   ├── services/
+  │   │   │   ├── transcription.js   ← llama Whisper
+  │   │   │   ├── detector.js        ← lógica de detección
+  │   │   │   ├── hasher.js          ← SHA-256
+  │   │   │   └── blockchain.js      ← interacción con Monad vía viem
+  │   │   └── db/
+  │   │       ├── client.js          ← pg client
+  │   │       └── migrations.sql     ← CREATE TABLE
+  │   ├── .env.example
+  │   └── package.json
+  │
+  ├── contracts/         ← Foundry project
+  │   ├── foundry.toml
+  │   ├── src/
+  │   │   └── AlpoEvidence.sol
+  │   ├── script/
+  │   │   └── Deploy.s.sol
+  │   └── test/
+  │       └── AlpoEvidence.t.sol
+  │
+  └── README.md
+
+================================================================================
+
+## 4. SMART CONTRACT
+
+### 4a. AlpoEvidence.sol
+
+```solidity
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.28;
+
+contract AlpoEvidence {
+    event EvidenceStored(
+        bytes32 indexed evidenceHash,
+        uint256 timestamp,
+        address indexed sender
+    );
+
+    struct EvidenceRecord {
+        bytes32 evidenceHash;
+        uint256 timestamp;
+        address sender;
+    }
+
+    EvidenceRecord[] public records;
+
+    function storeEvidence(bytes32 evidenceHash, uint256 timestamp) external {
+        records.push(EvidenceRecord({
+            evidenceHash: evidenceHash,
+            timestamp: timestamp,
+            sender: msg.sender
+        }));
+        emit EvidenceStored(evidenceHash, timestamp, msg.sender);
+    }
+
+    function getRecord(uint256 index) external view returns (EvidenceRecord memory) {
+        return records[index];
+    }
+
+    function totalRecords() external view returns (uint256) {
+        return records.length;
+    }
+}
+```
+
+### 4b. foundry.toml
+
+```toml
+[profile.default]
+src = "src"
+out = "out"
+libs = ["lib"]
+evm_version = "prague"
+solc_version = "0.8.28"
+```
+
+### 4c. Deploy.s.sol
+
+```solidity
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.28;
+import "forge-std/Script.sol";
+import "../src/AlpoEvidence.sol";
+
+contract DeployScript is Script {
+    function run() external {
+        vm.startBroadcast();
+        AlpoEvidence evidence = new AlpoEvidence();
+        console.log("AlpoEvidence deployed at:", address(evidence));
+        vm.stopBroadcast();
+    }
+}
+```
+
+### 4d. Comandos de despliegue (Monad Testnet)
+
+PASO 1 – Crear wallet y guardarla:
+  cast wallet new
+  # Guardar dirección y private key en contracts/.env (nunca en git)
+  echo "PRIVATE_KEY=0x..." > contracts/.env
+
+PASO 2 – Fondear wallet vía faucet:
+  curl -X POST https://agents.devnads.com/v1/faucet \
+    -H "Content-Type: application/json" \
+    -d '{"chainId": 10143, "address": "0xTU_DIRECCION"}'
+  # Si falla, usar: https://faucet.monad.xyz
+
+PASO 3 – Inicializar y desplegar:
+  cd contracts
+  forge init . --no-commit   # solo si no existe el proyecto aún
+  forge build
+  forge script script/Deploy.s.sol:DeployScript \
+    --rpc-url https://testnet-rpc.monad.xyz \
+    --private-key $PRIVATE_KEY \
+    --broadcast
+
+PASO 4 – Verificar en todos los explorers con un solo comando:
+  ADDR=<CONTRACT_ADDRESS>
+  STANDARD_INPUT=$(forge verify-contract $ADDR src/AlpoEvidence.sol:AlpoEvidence \
+    --chain 10143 --show-standard-json-input)
+  COMPILER_VERSION=$(jq -r '.metadata | fromjson | .compiler.version' \
+    out/AlpoEvidence.sol/AlpoEvidence.json)
+
+  curl -X POST https://agents.devnads.com/v1/verify \
+    -H "Content-Type: application/json" \
+    -d "{
+      \"chainId\": 10143,
+      \"contractAddress\": \"$ADDR\",
+      \"contractName\": \"src/AlpoEvidence.sol:AlpoEvidence\",
+      \"compilerVersion\": \"v${COMPILER_VERSION}\",
+      \"standardJsonInput\": $STANDARD_INPUT
+    }"
+
+Explorers para verificar manualmente:
+  - https://monad-testnet.socialscan.io
+  - https://testnet.monadvision.com
+  - https://testnet.monadscan.com
+
+================================================================================
+
+## 5. BACKEND (Node.js + Express)
+
+### 5a. package.json (dependencias clave)
+
+```json
+{
+  "dependencies": {
+    "express": "^4.18.2",
+    "multer": "^1.4.5-lts.1",
+    "openai": "^4.0.0",
+    "viem": "^2.0.0",
+    "pg": "^8.11.3",
+    "dotenv": "^16.3.1",
+    "cors": "^2.8.5"
+  }
+}
+```
+
+### 5b. .env.example
+
+```
+# OpenAI / Whisper
+OPENAI_API_KEY=sk-...
+
+# Monad
+MONAD_RPC_URL=https://testnet-rpc.monad.xyz
+MONAD_CHAIN_ID=10143
+PRIVATE_KEY=0x...           # wallet del sistema (firmante de tx)
+CONTRACT_ADDRESS=0x...       # dirección del contrato desplegado
+
+# PostgreSQL
+DATABASE_URL=postgresql://user:password@localhost:5432/alpo
+
+# App
+PORT=3001
+FRONTEND_URL=http://localhost:5173
+```
+
+### 5c. db/migrations.sql
+
+```sql
+CREATE TABLE IF NOT EXISTS evidence_logs (
+  id          SERIAL PRIMARY KEY,
+  transcription TEXT NOT NULL,
+  keyword_detected VARCHAR(100) NOT NULL,
+  evidence_hash CHAR(64) NOT NULL,   -- SHA-256 hex sin 0x
+  tx_hash       VARCHAR(66),         -- 0x + 64 hex chars
+  timestamp     BIGINT NOT NULL,     -- Unix ms
+  created_at    TIMESTAMPTZ DEFAULT NOW()
+);
+```
+
+### 5d. services/transcription.js
+
+```js
+import OpenAI from "openai";
+import fs from "fs";
+
+const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
+
+export async function transcribeAudio(filePath) {
+  const transcription = await openai.audio.transcriptions.create({
+    file: fs.createReadStream(filePath),
+    model: "whisper-1",
+    language: "es",
+  });
+  return transcription.text;
+}
+```
+
+ALTERNATIVA SIN OPENAI (HuggingFace Inference API gratuita):
+  - Modelo: openai/whisper-large-v3
+  - Endpoint: https://api-inference.huggingface.co/models/openai/whisper-large-v3
+  - Enviar el audio como binary en el body con header Authorization: Bearer HF_TOKEN
+  - Respuesta: { "text": "..." }
+  - Usar esta alternativa si no hay créditos de OpenAI disponibles.
+
+### 5e. services/detector.js
+
+```js
+const KEYWORDS = ["dinero fácil", "dinero facil"];
+
+export function detectKeyword(text) {
+  const normalized = text.toLowerCase()
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, ""); // quita tildes
+  const match = KEYWORDS.find(kw => {
+    const kwNorm = kw.normalize("NFD").replace(/[\u0300-\u036f]/g, "");
+    return normalized.includes(kwNorm);
+  });
+  return match || null;
+}
+```
+
+### 5f. services/hasher.js
+
+```js
+import crypto from "crypto";
+
+export function generateHash(payload) {
+  // payload = { transcription, timestamp, keyword }
+  return crypto
+    .createHash("sha256")
+    .update(JSON.stringify(payload))
+    .digest("hex");
+}
+```
+
+### 5g. services/blockchain.js
+
+```js
+import { createWalletClient, createPublicClient, http, parseAbiItem } from "viem";
+import { privateKeyToAccount } from "viem/accounts";
+import { monadTestnet } from "viem/chains";
+
+const CONTRACT_ABI = [
+  {
+    name: "storeEvidence",
+    type: "function",
+    stateMutability: "nonpayable",
+    inputs: [
+      { name: "evidenceHash", type: "bytes32" },
+      { name: "timestamp", type: "uint256" },
+    ],
+    outputs: [],
+  },
+];
+
+export async function storeEvidenceOnChain(hexHash, timestamp) {
+  const account = privateKeyToAccount(process.env.PRIVATE_KEY);
+
+  const walletClient = createWalletClient({
+    account,
+    chain: monadTestnet,
+    transport: http(process.env.MONAD_RPC_URL),
+  });
+
+  // hexHash viene como string hex de 64 chars (SHA-256), convertir a bytes32
+  const bytes32Hash = `0x${hexHash}`;
+
+  const txHash = await walletClient.writeContract({
+    address: process.env.CONTRACT_ADDRESS,
+    abi: CONTRACT_ABI,
+    functionName: "storeEvidence",
+    args: [bytes32Hash, BigInt(timestamp)],
+  });
+
+  return txHash;
+}
+```
+
+### 5h. routes/analyze.js (lógica principal)
+
+```js
+import express from "express";
+import multer from "multer";
+import path from "path";
+import fs from "fs";
+import { transcribeAudio } from "../services/transcription.js";
+import { detectKeyword } from "../services/detector.js";
+import { generateHash } from "../services/hasher.js";
+import { storeEvidenceOnChain } from "../services/blockchain.js";
+import { pool } from "../db/client.js";
+
+const router = express.Router();
+const upload = multer({ dest: "/tmp/alpo-uploads/" });
+
+router.post("/analyze", upload.single("audio"), async (req, res) => {
+  const filePath = req.file?.path;
+  if (!filePath) return res.status(400).json({ error: "No audio file received" });
+
+  try {
+    // 1. Transcribir
+    const transcription = await transcribeAudio(filePath);
+
+    // 2. Detectar
+    const keyword = detectKeyword(transcription);
+
+    if (!keyword) {
+      return res.json({ detected: false, transcription });
+    }
+
+    // 3. Hash
+    const timestamp = Date.now();
+    const payload = { transcription, timestamp, keyword };
+    const hash = generateHash(payload);
+
+    // 4. Blockchain
+    const txHash = await storeEvidenceOnChain(hash, timestamp);
+
+    // 5. PostgreSQL
+    await pool.query(
+      `INSERT INTO evidence_logs
+       (transcription, keyword_detected, evidence_hash, tx_hash, timestamp)
+       VALUES ($1, $2, $3, $4, $5)`,
+      [transcription, keyword, hash, txHash, timestamp]
+    );
+
+    return res.json({ detected: true, transcription, keyword, hash, txHash, timestamp });
+
+  } catch (err) {
+    console.error(err);
+    return res.status(500).json({ error: err.message });
+  } finally {
+    // Limpiar archivo temporal
+    if (filePath) fs.unlinkSync(filePath);
+  }
+});
+
+export default router;
+```
+
+### 5i. index.js (servidor principal)
+
+```js
+import "dotenv/config";
+import express from "express";
+import cors from "cors";
+import analyzeRouter from "./routes/analyze.js";
+
+const app = express();
+app.use(cors({ origin: process.env.FRONTEND_URL }));
+app.use(express.json());
+app.use("/api", analyzeRouter);
+
+app.listen(process.env.PORT || 3001, () => {
+  console.log(`ALPO backend running on port ${process.env.PORT || 3001}`);
+});
+```
+
+================================================================================
+
+## 6. FRONTEND (React + Vite)
+
+### 6a. Pantallas
+
+PANTALLA 1 – Upload / Record:
+  - Título: "ALPO – Protección Digital"
+  - Subtítulo: "Analiza audio en busca de señales de riesgo"
+  - Dos opciones:
+      a) Botón "🎙 Grabar Audio" → usa MediaRecorder API (ver AudioRecorder.jsx)
+      b) Input de archivo → acepta audio/* (FileUploader)
+  - Botón "Analizar" → dispara POST /api/analyze
+  - Estado de carga visible ("Transcribiendo y analizando...")
+
+PANTALLA 2 – Resultado (misma página, scroll o reemplazo):
+  a) Si detected: false
+     - Badge verde: "✅ Sin señales de riesgo detectadas"
+     - Transcripción completa en caja de texto
+  b) Si detected: true
+     - Banner rojo: "⚠️ ALERTA: Frase de riesgo detectada"
+     - Frase detectada resaltada en el texto
+     - Sección "Evidencia registrada en blockchain":
+         · Hash: 0x{hash} (copiable)
+         · TX Hash: 0x{txHash} → link a explorador Monad:
+           https://monad-testnet.socialscan.io/tx/{txHash}
+         · Timestamp legible
+     - Badge: "📱 Tutor notificado" (visual solamente en demo)
+
+### 6b. AudioRecorder.jsx (skeleton)
+
+```jsx
+import { useState, useRef } from "react";
+
+export function AudioRecorder({ onAudioReady }) {
+  const [recording, setRecording] = useState(false);
+  const mediaRecorderRef = useRef(null);
+  const chunksRef = useRef([]);
+
+  const startRecording = async () => {
+    const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+    const mediaRecorder = new MediaRecorder(stream);
+    mediaRecorderRef.current = mediaRecorder;
+    chunksRef.current = [];
+
+    mediaRecorder.ondataavailable = (e) => chunksRef.current.push(e.data);
+    mediaRecorder.onstop = () => {
+      const blob = new Blob(chunksRef.current, { type: "audio/webm" });
+      onAudioReady(blob);
+    };
+
+    mediaRecorder.start();
+    setRecording(true);
+  };
+
+  const stopRecording = () => {
+    mediaRecorderRef.current?.stop();
+    setRecording(false);
+  };
+
+  return (
+    <button onClick={recording ? stopRecording : startRecording}>
+      {recording ? "⏹ Detener grabación" : "🎙 Grabar Audio"}
+    </button>
+  );
+}
+```
+
+### 6c. App.jsx (flujo principal skeleton)
+
+```jsx
+import { useState } from "react";
+import { AudioRecorder } from "./components/AudioRecorder";
+
+const API_URL = import.meta.env.VITE_API_URL || "http://localhost:3001";
+
+export default function App() {
+  const [audioBlob, setAudioBlob] = useState(null);
+  const [loading, setLoading] = useState(false);
+  const [result, setResult] = useState(null);
+
+  const handleAnalyze = async () => {
+    if (!audioBlob) return;
+    setLoading(true);
+    const formData = new FormData();
+    formData.append("audio", audioBlob, "recording.webm");
+
+    const res = await fetch(`${API_URL}/api/analyze`, {
+      method: "POST",
+      body: formData,
+    });
+    const data = await res.json();
+    setResult(data);
+    setLoading(false);
+  };
+
+  return (
+    <div>
+      <h1>ALPO – Protección Digital</h1>
+      <AudioRecorder onAudioReady={setAudioBlob} />
+      {/* FileUploader también aquí */}
+      <button onClick={handleAnalyze} disabled={!audioBlob || loading}>
+        {loading ? "Analizando..." : "Analizar"}
+      </button>
+      {result && <ResultPanel result={result} />}
+    </div>
+  );
+}
+```
+
+### 6d. vite.config.js
+
+```js
+import { defineConfig } from "vite";
+import react from "@vitejs/plugin-react";
+
+export default defineConfig({
+  plugins: [react()],
+  server: { port: 5173 },
+});
+```
+
+### 6e. .env del frontend
+
+```
+VITE_API_URL=http://localhost:3001
+```
+
+================================================================================
+
+## 7. BASE DE DATOS (PostgreSQL)
+
+```sql
+-- Ejecutar una vez al iniciar el proyecto
+CREATE TABLE IF NOT EXISTS evidence_logs (
+  id                SERIAL PRIMARY KEY,
+  transcription     TEXT NOT NULL,
+  keyword_detected  VARCHAR(100) NOT NULL,
+  evidence_hash     CHAR(64) NOT NULL,
+  tx_hash           VARCHAR(66),
+  timestamp         BIGINT NOT NULL,
+  created_at        TIMESTAMPTZ DEFAULT NOW()
+);
+```
+
+Cliente (backend/src/db/client.js):
+```js
+import pg from "pg";
+const { Pool } = pg;
+export const pool = new Pool({ connectionString: process.env.DATABASE_URL });
+```
+
+================================================================================
+
+## 8. MONAD TESTNET – REFERENCIA RÁPIDA
+
+Red:          Monad Testnet
+Chain ID:     10143
+RPC:          https://testnet-rpc.monad.xyz
+Framework:    Foundry (NO Hardhat)
+EVM version:  prague  (Solidity 0.8.28+)
+Frontend:     import { monadTestnet } from "viem/chains"  ← NO definir custom chain
+
+Faucet:
+  curl -X POST https://agents.devnads.com/v1/faucet \
+    -H "Content-Type: application/json" \
+    -d '{"chainId": 10143, "address": "0xTU_WALLET"}'
+  Fallback: https://faucet.monad.xyz
+
+Verificación (un comando → 3 explorers):
+  Usar API https://agents.devnads.com/v1/verify (ver sección 4d)
+  NO usar `forge verify-contract` como primera opción.
+
+Explorers:
+  https://monad-testnet.socialscan.io/tx/{txHash}
+  https://testnet.monadvision.com/tx/{txHash}
+  https://testnet.monadscan.com/tx/{txHash}
+
+================================================================================
+
+## 9. ORDEN DE DESARROLLO RECOMENDADO
+
+1. Contratos primero:
+   a) Crear carpeta contracts/, configurar foundry.toml
+   b) Escribir AlpoEvidence.sol y test básico
+   c) Crear wallet → fondear con faucet → desplegar → verificar
+   d) Anotar CONTRACT_ADDRESS en .env del backend
+
+2. Backend:
+   a) `npm init -y` → instalar dependencias
+   b) Crear .env con todas las variables (ver 5b)
+   c) Ejecutar migrations.sql en PostgreSQL local
+   d) Implementar servicios en orden: transcription → detector → hasher → blockchain
+   e) Implementar route /api/analyze
+   f) Probar con curl o Postman antes de tocar el frontend:
+      curl -X POST http://localhost:3001/api/analyze \
+        -F "audio=@test_audio.webm"
+
+3. Frontend:
+   a) `npm create vite@latest frontend -- --template react`
+   b) Implementar AudioRecorder, FileUploader, App.jsx, ResultPanel
+   c) Conectar con backend vía fetch
+
+4. Integración final:
+   a) Verificar flujo completo con audio real que contenga "dinero fácil"
+   b) Confirmar que el txHash aparece en el explorador de Monad
+   c) Confirmar que el registro existe en PostgreSQL
+
+================================================================================
+
+## 10. CRITERIOS DE ÉXITO DEL DEMO
+
+El demo es funcional cuando:
+  ✓ Se puede grabar o subir un audio desde el navegador
+  ✓ El audio se transcribe correctamente al español
+  ✓ Con un audio que diga "dinero fácil" → se muestra la alerta roja
+  ✓ El txHash es visible y clickeable hacia el explorador de Monad Testnet
+  ✓ La transacción existe en la blockchain (verificable en explorador público)
+  ✓ Con un audio sin la frase → muestra badge verde "Sin riesgo"
+  ✓ No hay errores no manejados que rompan la UI
+
+================================================================================
+
+## 11. NOTAS PARA EL MODELO QUE IMPLEMENTE ESTO
+
+- NO uses `forge create`; usa siempre `forge script` para deployar.
+- NO definas cadena Monad personalizada en el frontend; importa `monadTestnet`
+  directamente desde `viem/chains`.
+- NO uses `--no-commit` en `forge init`; ese flag no existe en versiones recientes.
+- La wallet del sistema (que firma las tx) es una wallet controlada por el backend.
+  El usuario final NO necesita MetaMask ni wallet propia en el demo.
+- El hash que va al contrato es bytes32. SHA-256 produce 32 bytes → encaja perfecto.
+  Pásalo como `0x` + los 64 caracteres hex del hash.
+- Si Whisper API no está disponible, usar HuggingFace Inference API con el modelo
+  openai/whisper-large-v3 (ver sección 5d, alternativa sin OpenAI).
+- Todos los errores del backend deben retornar JSON { error: string }, nunca HTML.
+- El frontend debe mostrar errores de red de forma amigable, no stack traces.
+- Para el demo es suficiente con "dinero fácil" como única keyword. La arquitectura
+  (array KEYWORDS en detector.js) ya está preparada para escalar a más frases.
+
+================================================================================
+FIN DE LA ESPECIFICACIÓN
+================================================================================
