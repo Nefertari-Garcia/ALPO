@@ -1,5 +1,6 @@
 import fs from "fs";
 import path from "path";
+import FormData from "form-data";
 import fetch from "node-fetch";
 import Groq from "groq-sdk";
 
@@ -9,23 +10,39 @@ import Groq from "groq-sdk";
  * Fallback: HuggingFace Inference API
  */
 export async function transcribeAudio(filePath) {
-  // Groq requiere que el archivo tenga una extensión válida
-  // Multer guarda sin extensión, así que creamos un symlink/copia con extensión .webm
+  // Groq requiere extensión en el archivo
   const filePathWithExt = filePath + ".webm";
   fs.copyFileSync(filePath, filePathWithExt);
 
   try {
-    // Primario: Groq (whisper-large-v3-turbo)
+    // Primario: Groq usando node-fetch directamente (evita problema de File global)
     try {
-      const groq = new Groq({ apiKey: process.env.GROQ_API_KEY });
-      const transcription = await groq.audio.transcriptions.create({
-        file: fs.createReadStream(filePathWithExt),
-        model: "whisper-large-v3-turbo",
-        language: "es",
-        response_format: "json",
+      const form = new FormData();
+      form.append("file", fs.createReadStream(filePathWithExt), {
+        filename: "audio.webm",
+        contentType: "audio/webm",
       });
+      form.append("model", "whisper-large-v3-turbo");
+      form.append("language", "es");
+      form.append("response_format", "json");
+
+      const response = await fetch("https://api.groq.com/openai/v1/audio/transcriptions", {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${process.env.GROQ_API_KEY}`,
+          ...form.getHeaders(),
+        },
+        body: form,
+      });
+
+      if (!response.ok) {
+        const body = await response.text();
+        throw new Error(`Groq API error: ${response.status} - ${body}`);
+      }
+
+      const data = await response.json();
       console.log("Groq transcription successful");
-      return transcription.text;
+      return data.text;
     } catch (groqError) {
       console.error("Groq Whisper failed:", groqError.message);
     }
@@ -63,7 +80,6 @@ export async function transcribeAudio(filePath) {
       throw new Error("Transcription service unavailable");
     }
   } finally {
-    // Limpiar el archivo con extensión
     if (fs.existsSync(filePathWithExt)) {
       fs.unlinkSync(filePathWithExt);
     }
